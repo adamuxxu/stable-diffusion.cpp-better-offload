@@ -2078,9 +2078,7 @@ public:
              }
         }
 
-        int gpu_layers_assigned = 0;
         int total_layers_to_assign = n_gpu_layers;
-        bool cpu_mode = false;
 
         // If n_gpu_layers is set to a very high number (like 99, 1000, etc) treat it as all
         if (total_layers_to_assign >= 1000) total_layers_to_assign = 1000000;
@@ -2093,6 +2091,12 @@ public:
             ggml_backend_sched_set_tensor_backend(sched, zero_int_tensor, params_backend);
         }
 
+        // Set of tensors that are layer weights assigned to GPU
+        std::set<struct ggml_tensor*> gpu_weights;
+        std::set<struct ggml_tensor*> cpu_weights;
+
+        int current_layer_idx = 0;
+
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             struct ggml_tensor * node = ggml_graph_node(gf, i);
             if (node == nullptr) {
@@ -2100,30 +2104,37 @@ public:
                 continue;
             }
 
-            // Flash Attention check - always on GPU if possible
-            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                 ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
-                 continue;
-            }
+            // JIT Weight Streaming: All Compute Nodes are assigned to GPU (runtime_backend)
+            // We do NOT split the compute graph.
+            ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
 
             // Layer counting logic based on MUL_MAT
             if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-                if (gpu_layers_assigned < total_layers_to_assign) {
-                    ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
-                    gpu_layers_assigned++;
-                } else {
-                    cpu_mode = true;
-                }
-            }
+                bool is_gpu_layer = current_layer_idx < total_layers_to_assign;
 
-            if (cpu_mode && params_backend != runtime_backend) {
-                ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
+                // Track input weights
+                if (node->src[0] && node->src[0]->buffer == nullptr) { // It is a weight (no buffer yet) or CPU weight
+                     if (is_gpu_layer) {
+                         gpu_weights.insert(node->src[0]);
+                     } else {
+                         cpu_weights.insert(node->src[0]);
+                     }
+                }
+                if (node->src[1] && node->src[1]->buffer == nullptr && node->op == GGML_OP_MUL_MAT_ID) {
+                     if (is_gpu_layer) {
+                         gpu_weights.insert(node->src[1]);
+                     } else {
+                         cpu_weights.insert(node->src[1]);
+                     }
+                }
+
+                current_layer_idx++;
             }
         }
 
         LOG_DEBUG("%s: schedule_graph: Start leaf backend assignment (n_leafs=%d)", get_desc().c_str(), gf->n_leafs);
 
-        // Assign leafs (CRITICAL FIX)
+        // Assign leafs
         for (int i = 0; i < gf->n_leafs; i++) {
             struct ggml_tensor * leaf = gf->leafs[i];
             if (leaf == nullptr) {
@@ -2131,26 +2142,20 @@ public:
                 continue;
             }
 
-            // Assign leaf to the correct backend (runtime_backend if offloaded, or params_backend if not)
-            // If the leaf is already on GPU (e.g. pre-loaded), the scheduler should respect that if we don't force it?
-            // Actually, for weights that are CPU-resident (params_ctx), we MUST tell scheduler they are on params_backend.
-            // If we don't set it, buffer_id might remain -1 if the node using it is on a different backend and scheduler doesn't infer source.
-            // But scheduler *should* infer source if it's an input.
-            // However, the crash GGML_ASSERT(buffer_id >= 0) implies some tensor didn't get a buffer assigned.
-            // Setting backend for leafs explicitly solves this ambiguity.
-
-            // Heuristic: If leaf has no buffer (it's in params_ctx which is a raw context, not a backend buffer yet in this flow maybe?),
-            // or if it's explicitly one of our CPU tensors.
-
-            // We assign all leafs to params_backend by default, unless they are already on runtime_backend.
-            // The scheduler will handle copying to runtime_backend if needed for the operation.
-
             if (params_backend != runtime_backend) {
                  // Check if it's already assigned or has a buffer on runtime
                  if (leaf->buffer && !ggml_backend_buffer_is_host(leaf->buffer)) {
                      ggml_backend_sched_set_tensor_backend(sched, leaf, runtime_backend);
                  } else {
-                     ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
+                     // Check if it is a weight we explicitly wanted on GPU or CPU
+                     if (gpu_weights.count(leaf)) {
+                         ggml_backend_sched_set_tensor_backend(sched, leaf, runtime_backend);
+                     } else if (cpu_weights.count(leaf)) {
+                         ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
+                     } else {
+                         // Default: params_backend (CPU) for things not explicitly GPU
+                         ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
+                     }
                  }
             }
         }
