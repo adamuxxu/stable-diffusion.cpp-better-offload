@@ -245,7 +245,7 @@ public:
             sampler_rng = rng;
         }
 
-        ggml_log_set(ggml_log_callback_default, nullptr);
+        ggml_log_set(sd_ggml_log_callback_default, nullptr);
 
         init_backend();
 

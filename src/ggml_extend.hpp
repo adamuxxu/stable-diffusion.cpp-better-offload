@@ -26,6 +26,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+// Include ggml-impl.h to access ggml_cgraph internals (leafs)
+#include "../ggml/src/ggml-impl.h"
+
 #include "model.h"
 
 #ifdef SD_USE_CUDA
@@ -69,7 +72,7 @@ __STATIC_INLINE__ int align_up(int n, int multiple) {
     return n + align_up_offset(n, multiple);
 }
 
-__STATIC_INLINE__ void ggml_log_callback_default(ggml_log_level level, const char* text, void*) {
+__STATIC_INLINE__ void sd_ggml_log_callback_default(ggml_log_level level, const char* text, void*) {
     switch (level) {
         case GGML_LOG_LEVEL_DEBUG:
             LOG_DEBUG(text);
@@ -2109,12 +2112,32 @@ public:
             }
         }
 
-        // Ensure graph outputs are assigned to params backend (if they are on CPU, avoiding copy if possible)
-        // or just rely on scheduler to put them where they were computed.
-        // Actually, for leafs, if they are not computed nodes (like inputs), they should be handled by alloc_graph logic.
-        // But for graph outputs (leafs of the compute graph that are not weights), we usually want them accessible.
-        // The previous implementation used manual memory management for outputs.
-        // Scheduler will allocate them on the backend of the last operation.
+        // Assign leafs (CRITICAL FIX)
+        for (int i = 0; i < gf->n_leafs; i++) {
+            struct ggml_tensor * leaf = gf->leafs[i];
+            // Assign leaf to the correct backend (runtime_backend if offloaded, or params_backend if not)
+            // If the leaf is already on GPU (e.g. pre-loaded), the scheduler should respect that if we don't force it?
+            // Actually, for weights that are CPU-resident (params_ctx), we MUST tell scheduler they are on params_backend.
+            // If we don't set it, buffer_id might remain -1 if the node using it is on a different backend and scheduler doesn't infer source.
+            // But scheduler *should* infer source if it's an input.
+            // However, the crash GGML_ASSERT(buffer_id >= 0) implies some tensor didn't get a buffer assigned.
+            // Setting backend for leafs explicitly solves this ambiguity.
+
+            // Heuristic: If leaf has no buffer (it's in params_ctx which is a raw context, not a backend buffer yet in this flow maybe?),
+            // or if it's explicitly one of our CPU tensors.
+
+            // We assign all leafs to params_backend by default, unless they are already on runtime_backend.
+            // The scheduler will handle copying to runtime_backend if needed for the operation.
+
+            if (params_backend != runtime_backend) {
+                 // Check if it's already assigned or has a buffer on runtime
+                 if (leaf->buffer && !ggml_backend_buffer_is_host(leaf->buffer)) {
+                     ggml_backend_sched_set_tensor_backend(sched, leaf, runtime_backend);
+                 } else {
+                     ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
+                 }
+            }
+        }
     }
 
     bool compute(get_graph_cb_t get_graph,
