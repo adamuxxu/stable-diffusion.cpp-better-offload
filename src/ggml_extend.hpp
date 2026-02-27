@@ -2091,10 +2091,6 @@ public:
             ggml_backend_sched_set_tensor_backend(sched, zero_int_tensor, params_backend);
         }
 
-        // Set of tensors that are layer weights assigned to GPU
-        std::set<struct ggml_tensor*> gpu_weights;
-        std::set<struct ggml_tensor*> cpu_weights;
-
         int current_layer_idx = 0;
 
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
@@ -2110,24 +2106,7 @@ public:
 
             // Layer counting logic based on MUL_MAT
             if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-                bool is_gpu_layer = current_layer_idx < total_layers_to_assign;
-
-                // Track input weights
-                if (node->src[0] && node->src[0]->buffer == nullptr) { // It is a weight (no buffer yet) or CPU weight
-                     if (is_gpu_layer) {
-                         gpu_weights.insert(node->src[0]);
-                     } else {
-                         cpu_weights.insert(node->src[0]);
-                     }
-                }
-                if (node->src[1] && node->src[1]->buffer == nullptr && node->op == GGML_OP_MUL_MAT_ID) {
-                     if (is_gpu_layer) {
-                         gpu_weights.insert(node->src[1]);
-                     } else {
-                         cpu_weights.insert(node->src[1]);
-                     }
-                }
-
+                // Not actually using layer count for assignment anymore, but tracking it for debug/future
                 current_layer_idx++;
             }
         }
@@ -2135,6 +2114,8 @@ public:
         LOG_DEBUG("%s: schedule_graph: Start leaf backend assignment (n_leafs=%d)", get_desc().c_str(), gf->n_leafs);
 
         // Assign leafs
+        // In the custom streaming loop, we will manually manage CPU weights.
+        // For alloc_graph to work, we need to assign them to params_backend if they are not already on GPU.
         for (int i = 0; i < gf->n_leafs; i++) {
             struct ggml_tensor * leaf = gf->leafs[i];
             if (leaf == nullptr) {
@@ -2147,46 +2128,30 @@ public:
                  if (leaf->buffer && !ggml_backend_buffer_is_host(leaf->buffer)) {
                      ggml_backend_sched_set_tensor_backend(sched, leaf, runtime_backend);
                  } else {
-                     // Check if it is a weight we explicitly wanted on GPU or CPU
-                     if (gpu_weights.count(leaf)) {
-                         ggml_backend_sched_set_tensor_backend(sched, leaf, runtime_backend);
-                     } else if (cpu_weights.count(leaf)) {
-                         ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
-                     } else {
-                         // Default: params_backend (CPU) for things not explicitly GPU
-                         ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
-                     }
+                     // Default: params_backend (CPU)
+                     ggml_backend_sched_set_tensor_backend(sched, leaf, params_backend);
                  }
             }
         }
         LOG_DEBUG("%s: schedule_graph: Finished", get_desc().c_str());
     }
 
-
-    bool compute(get_graph_cb_t get_graph,
-                 int n_threads,
-                 bool free_compute_buffer_immediately = true,
-                 struct ggml_tensor** output          = nullptr,
-                 struct ggml_context* output_ctx      = nullptr) {
-        // Disabled monolithic offload
-        // if (!offload_params_to_runtime_backend()) { ... }
-
+    bool compute_custom_streaming(get_graph_cb_t get_graph, int n_threads, struct ggml_tensor** output, struct ggml_context* output_ctx, bool free_compute_buffer_immediately = true) {
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
 
-        LOG_DEBUG("%s: compute: scheduling graph", get_desc().c_str());
+        LOG_DEBUG("%s: compute_custom: scheduling graph", get_desc().c_str());
 
-        // Reset scheduler state before scheduling a new graph (Fix 1)
         if (sched != nullptr) {
             ggml_backend_sched_reset(sched);
         }
 
-        // Schedule graph (assign backends to nodes)
+        // Schedule graph (all nodes to GPU, weights to CPU/GPU)
         schedule_graph(gf);
 
-        LOG_DEBUG("%s: compute: allocating graph", get_desc().c_str());
+        LOG_DEBUG("%s: compute_custom: allocating graph", get_desc().c_str());
 
-        // Alloc graph using scheduler
+        // Alloc graph using scheduler - this reserves VRAM for activations
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             return false;
@@ -2194,22 +2159,96 @@ public:
 
         copy_data_to_backend_tensor();
 
-        // Set threads
         for (auto b : backends) {
             if (ggml_backend_is_cpu(b)) {
                 ggml_backend_cpu_set_n_threads(b, n_threads);
             }
         }
 
-        LOG_DEBUG("%s: compute: starting graph compute", get_desc().c_str());
-
-        ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
-            return false;
+        // Allocate a reusable VRAM buffer for streaming weights
+        size_t max_leaf_size = 0;
+        for (int i = 0; i < gf->n_leafs; i++) {
+            if (gf->leafs[i]->buffer == nullptr || ggml_backend_buffer_is_host(gf->leafs[i]->buffer)) {
+                max_leaf_size = std::max(max_leaf_size, ggml_nbytes(gf->leafs[i]));
+            }
         }
 
-        LOG_DEBUG("%s: compute: graph compute finished", get_desc().c_str());
+        // Align size
+        max_leaf_size = align_up(max_leaf_size, 1024);
+        LOG_INFO("%s: compute_custom: Max streaming weight size: %.2f MB", get_desc().c_str(), max_leaf_size / 1024.0 / 1024.0);
+
+        ggml_backend_buffer_t streaming_buffer = ggml_backend_alloc_buffer(runtime_backend, max_leaf_size);
+        struct ggml_tensor* streaming_tensor = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I8, max_leaf_size); // Placeholder type/shape
+        streaming_tensor->buffer = streaming_buffer;
+        streaming_tensor->data = ggml_backend_buffer_get_base(streaming_buffer);
+
+        LOG_DEBUG("%s: compute_custom: starting manual execution loop", get_desc().c_str());
+
+        // Custom Execution Loop
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            struct ggml_tensor * node = ggml_graph_node(gf, i);
+
+            // JIT Weight Loading
+            std::vector<std::pair<int, struct ggml_tensor*>> swapped_inputs;
+
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] && (node->src[j]->buffer == nullptr || ggml_backend_buffer_is_host(node->src[j]->buffer))) {
+                    // This input is on CPU (or raw memory). We need to stream it to GPU.
+                    struct ggml_tensor* cpu_tensor = node->src[j];
+
+                    // Copy to streaming buffer
+                    // Note: We are reusing the SAME streaming buffer for all inputs of a node.
+                    // This works if there is only 1 heavy CPU input (usually true for MatMul: Src0=W, Src1=X).
+                    // If both are CPU, we might have a problem. But usually Src1 (activation) is already on GPU from previous node.
+                    // If multiple weights, we'd need multiple buffers. Assuming 1 heavy weight for now.
+                    // For safety, checking if we already used it.
+                    if (!swapped_inputs.empty()) {
+                        LOG_WARN("Node %d has multiple CPU inputs. Streaming logic handles only 1 for now!", i);
+                    }
+
+                    // Update streaming tensor metadata to match CPU tensor
+                    streaming_tensor->type = cpu_tensor->type;
+                    streaming_tensor->ne[0] = cpu_tensor->ne[0];
+                    streaming_tensor->ne[1] = cpu_tensor->ne[1];
+                    streaming_tensor->ne[2] = cpu_tensor->ne[2];
+                    streaming_tensor->ne[3] = cpu_tensor->ne[3];
+                    streaming_tensor->nb[0] = cpu_tensor->nb[0];
+                    streaming_tensor->nb[1] = cpu_tensor->nb[1];
+                    streaming_tensor->nb[2] = cpu_tensor->nb[2];
+                    streaming_tensor->nb[3] = cpu_tensor->nb[3];
+
+                    // Copy Data
+                    ggml_backend_tensor_set(streaming_tensor, cpu_tensor->data, 0, ggml_nbytes(cpu_tensor));
+
+                    // Swap
+                    node->src[j] = streaming_tensor;
+                    swapped_inputs.push_back({j, cpu_tensor});
+                }
+            }
+
+            // Compute Single Node
+            // We construct a mini-graph
+            struct ggml_cgraph sub_gf = {};
+            sub_gf.n_nodes = 1;
+            sub_gf.nodes = &node;
+            // leafs not strictly needed for backend compute if inputs are valid
+
+            ggml_status st = ggml_backend_graph_compute(runtime_backend, &sub_gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                 LOG_ERROR("Compute failed at node %d", i);
+                 ggml_backend_buffer_free(streaming_buffer);
+                 return false;
+            }
+
+            // Restore inputs
+            for (auto& pair : swapped_inputs) {
+                node->src[pair.first] = pair.second;
+            }
+        }
+
+        LOG_DEBUG("%s: compute_custom: finished manual execution loop", get_desc().c_str());
+
+        ggml_backend_buffer_free(streaming_buffer);
 
 #ifdef GGML_PERF
         ggml_graph_print(gf);
@@ -2221,10 +2260,8 @@ public:
                 *output = ggml_dup_tensor(output_ctx, result);
             }
             if (*output != nullptr) {
-                // Scheduler handles result synchronization if needed, but we must get it from the backend where it resides
                 ggml_backend_t res_backend = ggml_backend_sched_get_tensor_backend(sched, result);
-                if (!res_backend) res_backend = runtime_backend; // Fallback
-
+                if (!res_backend) res_backend = runtime_backend;
                 ggml_ext_backend_tensor_get_and_sync(res_backend, result, (*output)->data, 0, ggml_nbytes(*output));
             }
         }
@@ -2233,6 +2270,16 @@ public:
             free_compute_buffer();
         }
         return true;
+    }
+
+    bool compute(get_graph_cb_t get_graph,
+                 int n_threads,
+                 bool free_compute_buffer_immediately = true,
+                 struct ggml_tensor** output          = nullptr,
+                 struct ggml_context* output_ctx      = nullptr) {
+
+        // Use custom streaming engine
+        return compute_custom_streaming(get_graph, n_threads, output, output_ctx, free_compute_buffer_immediately);
     }
 
     void set_flash_attention_enabled(bool enabled) {
