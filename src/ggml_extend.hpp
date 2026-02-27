@@ -1971,7 +1971,10 @@ public:
 
     void free_compute_buffer() {
         if (sched != nullptr) {
-            ggml_backend_sched_reset(sched);
+            // Aggressive cleanup: Free the scheduler to release VRAM pools immediately.
+            // This is critical when switching between large models (e.g. LLM -> Diffusion) on low-VRAM devices.
+            ggml_backend_sched_free(sched);
+            sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), MAX_GRAPH_SIZE, false, false);
         }
         offload_params_to_params_backend();
     }
@@ -2140,6 +2143,7 @@ public:
         }
     }
 
+
     bool compute(get_graph_cb_t get_graph,
                  int n_threads,
                  bool free_compute_buffer_immediately = true,
@@ -2151,8 +2155,10 @@ public:
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
 
-        // Reset scheduler state before scheduling a new graph
-        ggml_backend_sched_reset(sched);
+        // Reset scheduler state before scheduling a new graph (Fix 1)
+        if (sched != nullptr) {
+            ggml_backend_sched_reset(sched);
+        }
 
         // Schedule graph (assign backends to nodes)
         schedule_graph(gf);
