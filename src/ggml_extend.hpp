@@ -2151,6 +2151,9 @@ public:
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
 
+        // Reset scheduler state before scheduling a new graph
+        ggml_backend_sched_reset(sched);
+
         // Schedule graph (assign backends to nodes)
         schedule_graph(gf);
 
