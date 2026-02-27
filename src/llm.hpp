@@ -1444,6 +1444,10 @@ namespace LLM {
             model.get_param_tensors(tensors, prefix);
         }
 
+        void set_n_gpu_layers(int n) {
+            model.set_n_gpu_layers(n);
+        }
+
         void alloc_params_buffer() {
             model.alloc_params_buffer();
         }

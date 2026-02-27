@@ -940,6 +940,10 @@ struct CLIPTextModelRunner : public GGMLRunner {
         model.get_param_tensors(tensors, prefix);
     }
 
+    void set_n_gpu_layers(int n) {
+        GGMLRunner::set_n_gpu_layers(n);
+    }
+
     struct ggml_tensor* forward(GGMLRunnerContext* ctx,
                                 struct ggml_tensor* input_ids,
                                 struct ggml_tensor* embeddings,

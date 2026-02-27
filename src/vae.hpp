@@ -623,6 +623,7 @@ struct VAE : public GGMLRunner {
                          struct ggml_context* output_ctx)                                                         = 0;
     virtual void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors, const std::string prefix) = 0;
     virtual void set_conv2d_scale(float scale) { SD_UNUSED(scale); };
+    virtual void set_n_gpu_layers(int n) { GGMLRunner::set_n_gpu_layers(n); };
 };
 
 struct FakeVAE : public VAE {

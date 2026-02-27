@@ -21,10 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#include "ggml.h"
 
 #include "model.h"
 
@@ -1620,6 +1620,9 @@ protected:
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
 
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<ggml_backend_t> backends;
+
     struct ggml_context* params_ctx             = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
     struct ggml_context* offload_ctx            = nullptr;
@@ -1742,27 +1745,6 @@ protected:
     }
 
     bool alloc_compute_buffer(get_graph_cb_t get_graph) {
-        if (compute_allocr != nullptr) {
-            return true;
-        }
-        reset_compute_ctx();
-        struct ggml_cgraph* gf = get_compute_graph(get_graph);
-        backend_tensor_data_map.clear();
-        compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
-
-        if (!ggml_gallocr_reserve(compute_allocr, gf)) {
-            // failed to allocate the compute buffer
-            LOG_ERROR("%s: failed to allocate the compute buffer\n", get_desc().c_str());
-            free_compute_buffer();
-            return false;
-        }
-
-        // compute the required memory
-        size_t compute_buffer_size = ggml_gallocr_get_buffer_size(compute_allocr, 0);
-        LOG_DEBUG("%s compute buffer size: %.2f MB(%s)",
-                  get_desc().c_str(),
-                  compute_buffer_size / 1024.0 / 1024.0,
-                  ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM");
         return true;
     }
 
@@ -1901,11 +1883,19 @@ public:
     GGMLRunner(ggml_backend_t backend, bool offload_params_to_cpu = false)
         : runtime_backend(backend) {
         alloc_params_ctx();
-        if (!ggml_backend_is_cpu(runtime_backend) && offload_params_to_cpu) {
+        if (!ggml_backend_is_cpu(runtime_backend)) {
             params_backend = ggml_backend_cpu_init();
         } else {
             params_backend = runtime_backend;
         }
+
+        backends.push_back(runtime_backend);
+        if (params_backend != runtime_backend) {
+            backends.push_back(params_backend);
+        }
+
+        // Initialize scheduler
+        sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), MAX_GRAPH_SIZE, false, false);
     }
 
     virtual ~GGMLRunner() {
@@ -1913,6 +1903,9 @@ public:
         free_compute_buffer();
         free_params_ctx();
         free_compute_ctx();
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+        }
         if (params_backend != runtime_backend) {
             ggml_backend_free(params_backend);
         }
@@ -1974,9 +1967,8 @@ public:
     }
 
     void free_compute_buffer() {
-        if (compute_allocr != nullptr) {
-            ggml_gallocr_free(compute_allocr);
-            compute_allocr = nullptr;
+        if (sched != nullptr) {
+            ggml_backend_sched_reset(sched);
         }
         offload_params_to_params_backend();
     }
@@ -2014,31 +2006,141 @@ public:
         return ggml_get_tensor(cache_ctx, name.c_str());
     }
 
+    int n_gpu_layers = -1; // -1 for all layers, 0 for cpu only
+
+    void set_n_gpu_layers(int n) {
+        n_gpu_layers = n;
+    }
+
+    size_t get_available_vram() {
+        size_t free = 0;
+        size_t total = 0;
+        if (!ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(runtime_backend);
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
+        return free;
+    }
+
+    // Simple heuristic to assign layers to GPU
+    virtual void schedule_graph(struct ggml_cgraph * gf) {
+        if (backends.size() == 1 && ggml_backend_is_cpu(backends[0])) {
+            return;
+        }
+
+        // Auto-detect NGL if needed
+        if (n_gpu_layers == -1) {
+             if (ggml_backend_is_cpu(runtime_backend)) {
+                 n_gpu_layers = 0;
+             } else {
+                 size_t vram_free = get_available_vram();
+
+                 // Estimate memory for weights and compute buffers
+                 // This is an estimation.
+                 // Iterate graph to calculate total size of weights involved in matmuls
+                 int total_layers = 0;
+                 size_t total_weight_size = 0;
+                 for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                     struct ggml_tensor * node = ggml_graph_node(gf, i);
+                     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                         total_layers++;
+                         if (node->src[0]->buffer && !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
+                             // Already on GPU
+                         } else {
+                             total_weight_size += ggml_nbytes(node->src[0]);
+                         }
+                     }
+                 }
+
+                 // Reserve some VRAM for context/KV/activation (rough heuristic)
+                 size_t vram_reserved = 512 * 1024 * 1024; // 512MB safety margin
+
+                 if (vram_free > vram_reserved) {
+                     size_t available_for_layers = vram_free - vram_reserved;
+                     if (available_for_layers >= total_weight_size) {
+                         n_gpu_layers = total_layers; // All layers
+                     } else {
+                         // Fraction of layers
+                         double fraction = (double)available_for_layers / total_weight_size;
+                         n_gpu_layers = (int)(total_layers * fraction);
+                     }
+                 } else {
+                     n_gpu_layers = 0;
+                 }
+                 LOG_INFO("%s: Auto-detected NGL: %d / %d (VRAM free: %.2f MB)",
+                          get_desc().c_str(), n_gpu_layers, total_layers, vram_free / 1024.0 / 1024.0);
+             }
+        }
+
+        int gpu_layers_assigned = 0;
+        int total_layers_to_assign = n_gpu_layers;
+
+        // If n_gpu_layers is set to a very high number (like 99, 1000, etc) treat it as all
+        if (total_layers_to_assign >= 1000) total_layers_to_assign = 1000000;
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            struct ggml_tensor * node = ggml_graph_node(gf, i);
+
+            // Flash Attention check - always on GPU if possible
+            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                 ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
+                 continue;
+            }
+
+            // Layer counting logic based on MUL_MAT
+            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                if (gpu_layers_assigned < total_layers_to_assign) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
+                    gpu_layers_assigned++;
+                } else {
+                    // Fallback to CPU
+                    if (params_backend != runtime_backend) {
+                        ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
+                    }
+                }
+            } else {
+                // For other operations, follow the previous assignment or default
+
+                // If we strictly want to force everything else to CPU after limit:
+                if (gpu_layers_assigned >= total_layers_to_assign && total_layers_to_assign != 1000000) {
+                     if (params_backend != runtime_backend) {
+                        ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
+                     }
+                }
+            }
+        }
+    }
+
     bool compute(get_graph_cb_t get_graph,
                  int n_threads,
                  bool free_compute_buffer_immediately = true,
                  struct ggml_tensor** output          = nullptr,
                  struct ggml_context* output_ctx      = nullptr) {
-        if (!offload_params_to_runtime_backend()) {
-            LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
-            return false;
-        }
-        if (!alloc_compute_buffer(get_graph)) {
-            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
-            return false;
-        }
+        // Disabled monolithic offload
+        // if (!offload_params_to_runtime_backend()) { ... }
+
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
-        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+
+        // Schedule graph (assign backends to nodes)
+        schedule_graph(gf);
+
+        // Alloc graph using scheduler
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             return false;
         }
+
         copy_data_to_backend_tensor();
-        if (ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+
+        // Set threads
+        for (auto b : backends) {
+            if (ggml_backend_is_cpu(b)) {
+                ggml_backend_cpu_set_n_threads(b, n_threads);
+            }
         }
 
-        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return false;
@@ -2053,7 +2155,11 @@ public:
                 *output = ggml_dup_tensor(output_ctx, result);
             }
             if (*output != nullptr) {
-                ggml_ext_backend_tensor_get_and_sync(runtime_backend, result, (*output)->data, 0, ggml_nbytes(*output));
+                // Scheduler handles result synchronization if needed, but we must get it from the backend where it resides
+                ggml_backend_t res_backend = ggml_backend_sched_get_tensor_backend(sched, result);
+                if (!res_backend) res_backend = runtime_backend; // Fallback
+
+                ggml_ext_backend_tensor_get_and_sync(res_backend, result, (*output)->data, 0, ggml_nbytes(*output));
             }
         }
 

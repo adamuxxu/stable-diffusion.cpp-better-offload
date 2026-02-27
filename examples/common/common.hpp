@@ -428,6 +428,7 @@ static bool parse_options(int argc, const char** argv, const std::vector<ArgOpti
 
 struct SDContextParams {
     int n_threads = -1;
+    int n_gpu_layers = -1; // default to auto
     std::string model_path;
     std::string clip_l_path;
     std::string clip_g_path;
@@ -570,6 +571,10 @@ struct SDContextParams {
              "number of threads to use during computation (default: -1). "
              "If threads <= 0, then threads will be set to the number of CPU physical cores",
              &n_threads},
+            {"",
+             "--n-gpu-layers",
+             "number of layers to offload to GPU",
+             &n_gpu_layers},
             {"",
              "--chroma-t5-mask-pad",
              "t5 mask pad size of chroma",
@@ -878,6 +883,7 @@ struct SDContextParams {
         std::ostringstream oss;
         oss << "SDContextParams {\n"
             << "  n_threads: " << n_threads << ",\n"
+            << "  n_gpu_layers: " << n_gpu_layers << ",\n"
             << "  model_path: \"" << model_path << "\",\n"
             << "  clip_l_path: \"" << clip_l_path << "\",\n"
             << "  clip_g_path: \"" << clip_g_path << "\",\n"
@@ -959,6 +965,7 @@ struct SDContextParams {
             vae_decode_only,
             free_params_immediately,
             n_threads,
+            n_gpu_layers,
             wtype,
             rng_type,
             sampler_rng_type,

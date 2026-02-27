@@ -436,9 +436,11 @@ public:
                 cond_stage_model = std::make_shared<SD3CLIPEmbedder>(clip_backend,
                                                                      offload_params_to_cpu,
                                                                      tensor_storage_map);
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model  = std::make_shared<MMDiTModel>(backend,
                                                                offload_params_to_cpu,
                                                                tensor_storage_map);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -474,22 +476,26 @@ public:
                                                                           offload_params_to_cpu,
                                                                           tensor_storage_map);
                 }
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model = std::make_shared<FluxModel>(backend,
                                                               offload_params_to_cpu,
                                                               tensor_storage_map,
                                                               version,
                                                               sd_ctx_params->chroma_use_dit_mask);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
             } else if (sd_version_is_flux2(version)) {
                 bool is_chroma   = false;
                 cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend,
                                                                  offload_params_to_cpu,
                                                                  tensor_storage_map,
                                                                  version);
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model  = std::make_shared<FluxModel>(backend,
                                                               offload_params_to_cpu,
                                                               tensor_storage_map,
                                                               version,
                                                               sd_ctx_params->chroma_use_dit_mask);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
             } else if (sd_version_is_wan(version)) {
                 cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend,
                                                                     offload_params_to_cpu,
@@ -497,17 +503,20 @@ public:
                                                                     true,
                                                                     1,
                                                                     true);
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model  = std::make_shared<WanModel>(backend,
                                                              offload_params_to_cpu,
                                                              tensor_storage_map,
                                                              "model.diffusion_model",
                                                              version);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 if (strlen(SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path)) > 0) {
                     high_noise_diffusion_model = std::make_shared<WanModel>(backend,
                                                                             offload_params_to_cpu,
                                                                             tensor_storage_map,
                                                                             "model.high_noise_diffusion_model",
                                                                             version);
+                    high_noise_diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 }
                 if (diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
                     diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
@@ -515,6 +524,7 @@ public:
                     clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend,
                                                                              offload_params_to_cpu,
                                                                              tensor_storage_map);
+                    clip_vision->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                     clip_vision->alloc_params_buffer();
                     clip_vision->get_param_tensors(tensors);
                 }
@@ -529,22 +539,26 @@ public:
                                                                  version,
                                                                  "",
                                                                  enable_vision);
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model  = std::make_shared<QwenImageModel>(backend,
                                                                    offload_params_to_cpu,
                                                                    tensor_storage_map,
                                                                    "model.diffusion_model",
                                                                    version,
                                                                    sd_ctx_params->qwen_image_zero_cond_t);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
             } else if (sd_version_is_z_image(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend,
                                                                  offload_params_to_cpu,
                                                                  tensor_storage_map,
                                                                  version);
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model  = std::make_shared<ZImageModel>(backend,
                                                                 offload_params_to_cpu,
                                                                 tensor_storage_map,
                                                                 "model.diffusion_model",
                                                                 version);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
             } else {  // SD1.x SD2.x SDXL
                 std::map<std::string, std::string> embbeding_map;
                 for (uint32_t i = 0; i < sd_ctx_params->embedding_count; i++) {
@@ -564,10 +578,12 @@ public:
                                                                                            embbeding_map,
                                                                                            version);
                 }
+                cond_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 diffusion_model = std::make_shared<UNetModel>(backend,
                                                               offload_params_to_cpu,
                                                               tensor_storage_map,
                                                               version);
+                diffusion_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                 if (sd_ctx_params->diffusion_conv_direct) {
                     LOG_INFO("Using Conv2d direct in the diffusion model");
                     std::dynamic_pointer_cast<UNetModel>(diffusion_model)->unet.set_conv2d_direct_enabled(true);
@@ -604,6 +620,7 @@ public:
                                                                             "first_stage_model",
                                                                             vae_decode_only,
                                                                             version);
+                    first_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                     first_stage_model->alloc_params_buffer();
                     first_stage_model->get_param_tensors(tensors, "first_stage_model");
                 } else if (version == VERSION_CHROMA_RADIANCE) {
@@ -617,6 +634,7 @@ public:
                                                                         vae_decode_only,
                                                                         false,
                                                                         version);
+                    first_stage_model->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                     if (sd_ctx_params->vae_conv_direct) {
                         LOG_INFO("Using Conv2d direct in the vae model");
                         first_stage_model->set_conv2d_direct_enabled(true);
@@ -650,6 +668,7 @@ public:
                                                                              vae_decode_only,
                                                                              version);
                     if (version == VERSION_SDXS) {
+                        tae_first_stage->set_n_gpu_layers(sd_ctx_params->n_gpu_layers);
                         tae_first_stage->alloc_params_buffer();
                         tae_first_stage->get_param_tensors(tensors, "first_stage_model");
                     }
@@ -2922,6 +2941,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->vae_decode_only         = true;
     sd_ctx_params->free_params_immediately = true;
     sd_ctx_params->n_threads               = sd_get_num_physical_cores();
+    sd_ctx_params->n_gpu_layers            = -1;
     sd_ctx_params->wtype                   = SD_TYPE_COUNT;
     sd_ctx_params->rng_type                = CUDA_RNG;
     sd_ctx_params->sampler_rng_type        = RNG_TYPE_COUNT;
@@ -2964,6 +2984,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "vae_decode_only: %s\n"
              "free_params_immediately: %s\n"
              "n_threads: %d\n"
+             "n_gpu_layers: %d\n"
              "wtype: %s\n"
              "rng_type: %s\n"
              "sampler_rng_type: %s\n"
@@ -2996,6 +3017,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->vae_decode_only),
              BOOL_STR(sd_ctx_params->free_params_immediately),
              sd_ctx_params->n_threads,
+             sd_ctx_params->n_gpu_layers,
              sd_type_name(sd_ctx_params->wtype),
              sd_rng_type_name(sd_ctx_params->rng_type),
              sd_rng_type_name(sd_ctx_params->sampler_rng_type),

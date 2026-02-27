@@ -179,6 +179,7 @@ typedef struct {
     bool vae_decode_only;
     bool free_params_immediately;
     int n_threads;
+    int n_gpu_layers;
     enum sd_type_t wtype;
     enum rng_type_t rng_type;
     enum rng_type_t sampler_rng_type;
