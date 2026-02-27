@@ -40,6 +40,7 @@ struct Conditioner {
     virtual void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors)    = 0;
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_flash_attention_enabled(bool enabled)                                 = 0;
+    virtual void set_n_gpu_layers(int n) {}
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual std::tuple<SDCondition, std::vector<bool>> get_learned_condition_with_trigger(ggml_context* work_ctx,
                                                                                           int n_threads,
@@ -125,6 +126,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         text_model->set_flash_attention_enabled(enabled);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_flash_attention_enabled(enabled);
+        }
+    }
+
+    void set_n_gpu_layers(int n) override {
+        text_model->set_n_gpu_layers(n);
+        if (sd_version_is_sdxl(version)) {
+            text_model2->set_n_gpu_layers(n);
         }
     }
 
@@ -808,6 +816,18 @@ struct SD3CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_n_gpu_layers(int n) override {
+        if (clip_l) {
+            clip_l->set_n_gpu_layers(n);
+        }
+        if (clip_g) {
+            clip_g->set_n_gpu_layers(n);
+        }
+        if (t5) {
+            t5->set_n_gpu_layers(n);
+        }
+    }
+
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         if (clip_l) {
             clip_l->set_weight_adapter(adapter);
@@ -1222,6 +1242,15 @@ struct FluxCLIPEmbedder : public Conditioner {
         }
         if (t5) {
             t5->set_flash_attention_enabled(enabled);
+        }
+    }
+
+    void set_n_gpu_layers(int n) override {
+        if (clip_l) {
+            clip_l->set_n_gpu_layers(n);
+        }
+        if (t5) {
+            t5->set_n_gpu_layers(n);
         }
     }
 
@@ -1692,6 +1721,10 @@ struct LLMEmbedder : public Conditioner {
 
     void set_flash_attention_enabled(bool enabled) override {
         llm->set_flash_attention_enabled(enabled);
+    }
+
+    void set_n_gpu_layers(int n) override {
+        llm->set_n_gpu_layers(n);
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
