@@ -2085,6 +2085,8 @@ public:
         // If n_gpu_layers is set to a very high number (like 99, 1000, etc) treat it as all
         if (total_layers_to_assign >= 1000) total_layers_to_assign = 1000000;
 
+        LOG_DEBUG("%s: schedule_graph: Start node backend assignment", get_desc().c_str());
+
         // Force build-in tensors to CPU
         if (params_backend != runtime_backend) {
             ggml_backend_sched_set_tensor_backend(sched, one_tensor, params_backend);
@@ -2093,6 +2095,10 @@ public:
 
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             struct ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node == nullptr) {
+                LOG_ERROR("%s: schedule_graph: NULL node encountered at index %d", get_desc().c_str(), i);
+                continue;
+            }
 
             // Flash Attention check - always on GPU if possible
             if (node->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -2115,9 +2121,16 @@ public:
             }
         }
 
+        LOG_DEBUG("%s: schedule_graph: Start leaf backend assignment (n_leafs=%d)", get_desc().c_str(), gf->n_leafs);
+
         // Assign leafs (CRITICAL FIX)
         for (int i = 0; i < gf->n_leafs; i++) {
             struct ggml_tensor * leaf = gf->leafs[i];
+            if (leaf == nullptr) {
+                LOG_ERROR("%s: schedule_graph: NULL leaf encountered at index %d", get_desc().c_str(), i);
+                continue;
+            }
+
             // Assign leaf to the correct backend (runtime_backend if offloaded, or params_backend if not)
             // If the leaf is already on GPU (e.g. pre-loaded), the scheduler should respect that if we don't force it?
             // Actually, for weights that are CPU-resident (params_ctx), we MUST tell scheduler they are on params_backend.
@@ -2141,6 +2154,7 @@ public:
                  }
             }
         }
+        LOG_DEBUG("%s: schedule_graph: Finished", get_desc().c_str());
     }
 
 
@@ -2155,6 +2169,8 @@ public:
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
 
+        LOG_DEBUG("%s: compute: scheduling graph", get_desc().c_str());
+
         // Reset scheduler state before scheduling a new graph (Fix 1)
         if (sched != nullptr) {
             ggml_backend_sched_reset(sched);
@@ -2162,6 +2178,8 @@ public:
 
         // Schedule graph (assign backends to nodes)
         schedule_graph(gf);
+
+        LOG_DEBUG("%s: compute: allocating graph", get_desc().c_str());
 
         // Alloc graph using scheduler
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -2178,11 +2196,16 @@ public:
             }
         }
 
+        LOG_DEBUG("%s: compute: starting graph compute", get_desc().c_str());
+
         ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return false;
         }
+
+        LOG_DEBUG("%s: compute: graph compute finished", get_desc().c_str());
+
 #ifdef GGML_PERF
         ggml_graph_print(gf);
 #endif
