@@ -2074,9 +2074,16 @@ public:
 
         int gpu_layers_assigned = 0;
         int total_layers_to_assign = n_gpu_layers;
+        bool cpu_mode = false;
 
         // If n_gpu_layers is set to a very high number (like 99, 1000, etc) treat it as all
         if (total_layers_to_assign >= 1000) total_layers_to_assign = 1000000;
+
+        // Force build-in tensors to CPU
+        if (params_backend != runtime_backend) {
+            ggml_backend_sched_set_tensor_backend(sched, one_tensor, params_backend);
+            ggml_backend_sched_set_tensor_backend(sched, zero_int_tensor, params_backend);
+        }
 
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             struct ggml_tensor * node = ggml_graph_node(gf, i);
@@ -2093,22 +2100,21 @@ public:
                     ggml_backend_sched_set_tensor_backend(sched, node, runtime_backend);
                     gpu_layers_assigned++;
                 } else {
-                    // Fallback to CPU
-                    if (params_backend != runtime_backend) {
-                        ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
-                    }
-                }
-            } else {
-                // For other operations, follow the previous assignment or default
-
-                // If we strictly want to force everything else to CPU after limit:
-                if (gpu_layers_assigned >= total_layers_to_assign && total_layers_to_assign != 1000000) {
-                     if (params_backend != runtime_backend) {
-                        ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
-                     }
+                    cpu_mode = true;
                 }
             }
+
+            if (cpu_mode && params_backend != runtime_backend) {
+                ggml_backend_sched_set_tensor_backend(sched, node, params_backend);
+            }
         }
+
+        // Ensure graph outputs are assigned to params backend (if they are on CPU, avoiding copy if possible)
+        // or just rely on scheduler to put them where they were computed.
+        // Actually, for leafs, if they are not computed nodes (like inputs), they should be handled by alloc_graph logic.
+        // But for graph outputs (leafs of the compute graph that are not weights), we usually want them accessible.
+        // The previous implementation used manual memory management for outputs.
+        // Scheduler will allocate them on the backend of the last operation.
     }
 
     bool compute(get_graph_cb_t get_graph,
